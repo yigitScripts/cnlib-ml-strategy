@@ -40,11 +40,22 @@ class FinalStrategy(BaseStrategy):
         actives = [c for c, s in long_coins if s == 1]
         alloc   = round(1.0 / len(actives), 2) if actives else 0.0
 
+        STOP_LOSS_PCT   = 0.05   # %5 zarar → pozisyonu kapat
+        TAKE_PROFIT_PCT = 0.15   # %15 kâr  → pozisyonu kapat
+
         decisions = []
         for coin, signal in long_coins:
+            df            = data[coin]
+            current_price = df["Close"].iloc[-1]
             if signal == 1:
-                decisions.append({"coin": coin, "signal": 1,
-                                   "allocation": alloc, "leverage": 2})
+                decisions.append({
+                    "coin":        coin,
+                    "signal":      1,
+                    "allocation":  alloc,
+                    "leverage":    2,
+                    "stop_loss":   current_price * (1 - STOP_LOSS_PCT),
+                    "take_profit": current_price * (1 + TAKE_PROFIT_PCT),
+                })
             else:
                 decisions.append({"coin": coin, "signal": 0,
                                    "allocation": 0.0, "leverage": 1})

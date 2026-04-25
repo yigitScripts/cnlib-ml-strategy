@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import accuracy_score
 from cnlib.base_strategy import BaseStrategy
 from cnlib import backtest
@@ -16,15 +16,17 @@ COINS = [
     "tamcoin-usd_train",
 ]
 
-TOTAL_DAYS      = 1570
-PREDICT_DAYS    = 368
-TRAIN_DAYS      = TOTAL_DAYS - PREDICT_DAYS   # 1202
-START_CANDLE    = TRAIN_DAYS                   # 1202
-CHUNK           = TRAIN_DAYS // 4             # 300 (her parça)
+TOTAL_DAYS   = 1570
+PREDICT_DAYS = 368
+TRAIN_DAYS   = TOTAL_DAYS - PREDICT_DAYS  # 1202
+START_CANDLE = TRAIN_DAYS                 # 1202
+CHUNK        = TRAIN_DAYS // 4            # 300
 
 STOP_LOSS_PCT   = 0.05
 TAKE_PROFIT_PCT = 0.15
 
+
+# ── Veri toplama ──────────────────────────────────────────────────────────────
 
 def get_full_data():
     collected = {}
@@ -39,131 +41,213 @@ def get_full_data():
                 for c in data
             ]
 
-    t = TempStrategy()
-    backtest.run(strategy=t, initial_capital=3000.0, silent=True)
+    backtest.run(strategy=TempStrategy(), initial_capital=3000.0, silent=True)
     return collected
 
 
-def split_by_chunk(df, n_chunks_train):
-    """
-    n_chunks_train: kaç chunk eğitimde kullanılacak (1,2,3,4)
-    Train: ilk n_chunks_train * CHUNK gün
-    Val:   sonraki CHUNK gün (parça 4 için kalan tüm eğitim verisi)
-    """
-    train_end = min(n_chunks_train * CHUNK, TRAIN_DAYS)
+# ── Veri bölme ────────────────────────────────────────────────────────────────
+
+def split_by_chunk(df, n):
+    train_end = min(n * CHUNK, TRAIN_DAYS)
     val_end   = min(train_end + CHUNK, TRAIN_DAYS)
-    train = df.iloc[:train_end]
-    val   = df.iloc[train_end:val_end]
-    return train, val
+    return df.iloc[:train_end], df.iloc[train_end:val_end]
 
 
-def train_models(coin_data, n_chunks_train):
+# ── Model eğitimi ─────────────────────────────────────────────────────────────
+
+def make_model(seed=42):
+    return RandomForestClassifier(
+        n_estimators=300,
+        max_depth=5,
+        min_samples_leaf=15,
+        random_state=seed,
+        n_jobs=-1,
+    )
+
+def make_model_gb(seed=42):
+    return GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        random_state=seed,
+    )
+
+
+def train_models(coin_data, n):
+    """
+    Her coin için iki model eğitir:
+        long_model  → yarın fiyat yükselecek mi?
+        short_model → yarın fiyat düşecek mi?
+    Her biri için RF + GB ensemble kullanır.
+    """
     models = {}
     for coin in COINS:
         df = coin_data[coin]
-        train_df, val_df = split_by_chunk(df, n_chunks_train)
+        train_df, val_df = split_by_chunk(df, n)
 
         print(f"  [{coin}] train={len(train_df)} gun, val={len(val_df)} gun")
 
-        X_train, y_train, mask_train = build_features(train_df)
-        X_train, y_train = X_train[mask_train], y_train[mask_train]
+        X_tr, y_long_tr, y_short_tr, mask_tr = build_features(train_df)
+        X_tr      = X_tr[mask_tr]
+        y_long_tr = y_long_tr[mask_tr]
+        y_short_tr = y_short_tr[mask_tr]
 
-        if len(X_train) < 10:
-            print(f"  [{coin}] Yeterli veri yok, atlanıyor.")
+        if len(X_tr) < 20:
+            print(f"  [{coin}] Yetersiz veri.")
             continue
 
-        model = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=5,
-            min_samples_leaf=15,
-            random_state=42,
-            n_jobs=-1,
-        )
-        model.fit(X_train, y_train)
+        # Long modelleri
+        rf_long = make_model(42)
+        gb_long = make_model_gb(42)
+        rf_long.fit(X_tr, y_long_tr)
+        gb_long.fit(X_tr, y_long_tr)
+
+        # Short modelleri
+        rf_short = make_model(99)
+        gb_short = make_model_gb(99)
+        rf_short.fit(X_tr, y_short_tr)
+        gb_short.fit(X_tr, y_short_tr)
 
         if len(val_df) > 51:
-            X_val, y_val, mask_val = build_features(val_df)
-            X_val, y_val = X_val[mask_val], y_val[mask_val]
-            if len(X_val) > 0:
-                acc = accuracy_score(y_val, model.predict(X_val))
-                print(f"  [{coin}] Parca {n_chunks_train}→{n_chunks_train+1} "
-                      f"accuracy: {acc:.3f}")
+            X_v, y_long_v, y_short_v, mask_v = build_features(val_df)
+            X_v = X_v[mask_v]
+            if len(X_v) > 0:
+                # Ensemble tahmin: RF + GB ortalaması
+                lp = (rf_long.predict_proba(X_v)[:, 1] +
+                      gb_long.predict_proba(X_v)[:, 1]) / 2
+                sp = (rf_short.predict_proba(X_v)[:, 1] +
+                      gb_short.predict_proba(X_v)[:, 1]) / 2
+                acc_l = accuracy_score(y_long_v[mask_v],  (lp > 0.5).astype(int))
+                acc_s = accuracy_score(y_short_v[mask_v], (sp > 0.5).astype(int))
+                print(f"  [{coin}] Parca {n}→{n+1}  "
+                      f"long_acc={acc_l:.3f}  short_acc={acc_s:.3f}")
 
-        models[coin] = model
+        models[coin] = {
+            "rf_long":  rf_long,
+            "gb_long":  gb_long,
+            "rf_short": rf_short,
+            "gb_short": gb_short,
+        }
+
     return models
 
 
+# ── Grafik ────────────────────────────────────────────────────────────────────
+
 def plot_predictions(coin_data, all_models, coin):
     df = coin_data[coin]
-    fig, axes = plt.subplots(4, 1, figsize=(14, 18))
-    fig.suptitle(f"{coin} — Walk-Forward Tahminler (her parca {CHUNK} gun)",
-                 fontsize=13)
+    fig, axes = plt.subplots(4, 1, figsize=(15, 20))
+    fig.suptitle(f"{coin} — Walk-Forward (Long & Short Sinyaller)", fontsize=13)
 
     for n in range(1, 5):
         ax = axes[n - 1]
         _, val_df = split_by_chunk(df, n)
 
-        label = (f"Parca {n} → Parca {n+1} tahmini"
-                 if n < 4 else
-                 f"Parca {n} → TAHMIN DONEMI ({PREDICT_DAYS} gun)")
+        label = (f"Parca {n}→{n+1}"
+                 if n < 4 else f"Parca {n} → TAHMIN ({PREDICT_DAYS} gun)")
 
         if coin not in all_models[n] or len(val_df) < 5:
             ax.set_title(f"{label}: Yeterli veri yok")
             continue
 
-        model  = all_models[n][coin]
-        X_val, y_val, mask_val = build_features(val_df)
-        closes = val_df["Close"].values[mask_val]
-        preds  = model.predict(X_val[mask_val])
+        m = all_models[n][coin]
+        X_v, _, _, mask_v = build_features(val_df)
+        closes = val_df["Close"].values[mask_v]
 
-        ax.plot(closes, label="Gercek Fiyat", color="royalblue", linewidth=1.2)
+        lp = (m["rf_long"].predict_proba(X_v[mask_v])[:, 1] +
+              m["gb_long"].predict_proba(X_v[mask_v])[:, 1]) / 2
+        sp = (m["rf_short"].predict_proba(X_v[mask_v])[:, 1] +
+              m["gb_short"].predict_proba(X_v[mask_v])[:, 1]) / 2
 
-        long_idx  = [i for i, p in enumerate(preds) if p == 1]
-        short_idx = [i for i, p in enumerate(preds) if p == 0]
+        ax.plot(closes, color="royalblue", linewidth=1.2, label="Fiyat")
 
-        ax.scatter(long_idx,  closes[long_idx],  color="green", s=10,
-                   alpha=0.6, label="Long sinyali")
-        ax.scatter(short_idx, closes[short_idx], color="red",   s=10,
-                   alpha=0.4, label="Dur sinyali")
+        long_idx  = [i for i, p in enumerate(lp) if p >= 0.55]
+        short_idx = [i for i, p in enumerate(sp) if p >= 0.55]
+
+        ax.scatter(long_idx,  closes[long_idx],
+                   color="lime",   s=12, alpha=0.7, label="Long")
+        ax.scatter(short_idx, closes[short_idx],
+                   color="red",    s=12, alpha=0.7, label="Short")
 
         ax.set_title(label)
-        ax.set_ylabel("Fiyat (USD)")
+        ax.set_ylabel("Fiyat")
         ax.legend(fontsize=7)
 
     plt.tight_layout()
     os.makedirs("outputs", exist_ok=True)
     safe = coin.replace("-", "_").replace("/", "_")
-    path = f"outputs/{safe}_walkforward.png"
+    path = f"outputs/{safe}_advanced.png"
     plt.savefig(path, dpi=120)
     print(f"  Graf kaydedildi: {path}")
     plt.close()
 
 
-class WalkForwardStrategy(BaseStrategy):
+# ── Strateji ──────────────────────────────────────────────────────────────────
+
+class AdvancedStrategy(BaseStrategy):
 
     def __init__(self, trained_models):
         super().__init__()
         self.modeller = trained_models[4]
 
-    def _confidence(self, model, x):
-        proba = model.predict_proba([x])[0]
-        return proba[1]
+    # ── Regime tespiti ────────────────────────────────────────────────────────
+    def _regime(self, df):
+        """
+        Piyasa rejimini tespit et.
+        Döndürür: 'bull', 'bear', 'sideways'
+        Çarpan:   bull=1.2, bear=1.2 (short için), sideways=0.6
+        """
+        closes = df["Close"].values
+        if len(closes) < 200:
+            return "sideways", 0.6
 
-    def _leverage_and_alloc(self, confidence):
-        """Yüksek leverage → düşük pay, düşük leverage → yüksek pay."""
-        if confidence >= 0.75:
-            return 10, 0.10
-        elif confidence >= 0.68:
-            return 5,  0.20
-        elif confidence >= 0.62:
-            return 3,  0.30
-        elif confidence >= 0.57:
-            return 2,  0.40
-        elif confidence >= 0.52:
-            return 1,  0.55
+        ma50  = closes[-50:].mean()  if len(closes) >= 50  else closes.mean()
+        ma200 = closes[-200:].mean() if len(closes) >= 200 else closes.mean()
+        price = closes[-1]
+
+        # Volatilite (sideways tespiti)
+        std20 = closes[-20:].std() / price if len(closes) >= 20 else 0.02
+
+        if price > ma50 > ma200:
+            return "bull", 1.2        # güçlü boğa
+        elif price < ma50 < ma200:
+            return "bear", 1.2        # güçlü ayı (short için çarpan)
+        elif std20 < 0.015:
+            return "sideways", 0.6    # yatay → daha temkinli
         else:
-            return 0,  0.0  # sinyal yok
+            return "neutral", 0.9
 
+    # ── Ensemble confidence ───────────────────────────────────────────────────
+    def _signals(self, coin, X_last):
+        m  = self.modeller[coin]
+        lp = (m["rf_long"].predict_proba([X_last])[0][1] +
+              m["gb_long"].predict_proba([X_last])[0][1]) / 2
+        sp = (m["rf_short"].predict_proba([X_last])[0][1] +
+              m["gb_short"].predict_proba([X_last])[0][1]) / 2
+        return lp, sp
+
+    # ── Risk kademesi ─────────────────────────────────────────────────────────
+    def _risk_tier(self, confidence, regime_mult):
+        """
+        Yüksek leverage → düşük pay
+        Düşük leverage  → yüksek pay
+        Regime çarpanı ile ölçekle.
+        """
+        c = confidence * regime_mult
+        if c >= 0.90:
+            return 10, 0.08
+        elif c >= 0.80:
+            return 5,  0.18
+        elif c >= 0.70:
+            return 3,  0.28
+        elif c >= 0.62:
+            return 2,  0.38
+        elif c >= 0.55:
+            return 1,  0.50
+        else:
+            return 0,  0.0   # sinyal yok
+
+    # ── Ana karar ─────────────────────────────────────────────────────────────
     def predict(self, data: dict) -> list[dict]:
         decisions  = []
         candidates = []
@@ -175,32 +259,69 @@ class WalkForwardStrategy(BaseStrategy):
                 candidates.append((coin, 0, 0.0, 0.0))
                 continue
 
-            X, _, mask = build_features(df)
+            X, _, _, mask = build_features(df)
             if not mask[-1]:
                 candidates.append((coin, 0, 0.0, 0.0))
                 continue
 
-            confidence      = self._confidence(self.modeller[coin], X[-1])
-            leverage, alloc = self._leverage_and_alloc(confidence)
-            candidates.append((coin, leverage, alloc, confidence))
+            regime, regime_mult = self._regime(df)
+            long_p, short_p     = self._signals(coin, X[-1])
 
-        # Toplam allocation %90'ı geçmesin
-        total_alloc = sum(a for _, l, a, _ in candidates if l > 0)
-        scale       = min(1.0, 0.90 / total_alloc) if total_alloc > 0 else 1.0
+            # Regime'e göre hangi yönü tercih edelim
+            if regime == "bull":
+                # Boğada: long sinyali varsa aç, short sinyali çok güçlü değilse yoksay
+                if long_p >= 0.52:
+                    lev, alloc = self._risk_tier(long_p, regime_mult)
+                    candidates.append((coin, 1, alloc, lev))
+                elif short_p >= 0.70:   # çok güçlü short sinyali bile olsa dikkatli
+                    lev, alloc = self._risk_tier(short_p * 0.8, regime_mult * 0.7)
+                    candidates.append((coin, -1, alloc, lev))
+                else:
+                    candidates.append((coin, 0, 0.0, 0))
 
-        for coin, leverage, alloc, confidence in candidates:
+            elif regime == "bear":
+                # Ayıda: short sinyali varsa aç, long çok güçlüyse al
+                if short_p >= 0.52:
+                    lev, alloc = self._risk_tier(short_p, regime_mult)
+                    candidates.append((coin, -1, alloc, lev))
+                elif long_p >= 0.70:
+                    lev, alloc = self._risk_tier(long_p * 0.8, regime_mult * 0.7)
+                    candidates.append((coin, 1, alloc, lev))
+                else:
+                    candidates.append((coin, 0, 0.0, 0))
+
+            else:
+                # Neutral/Sideways: her iki yön de mümkün ama daha küçük pozisyon
+                if long_p > short_p and long_p >= 0.57:
+                    lev, alloc = self._risk_tier(long_p, regime_mult)
+                    candidates.append((coin, 1, alloc, lev))
+                elif short_p > long_p and short_p >= 0.57:
+                    lev, alloc = self._risk_tier(short_p, regime_mult)
+                    candidates.append((coin, -1, alloc, lev))
+                else:
+                    candidates.append((coin, 0, 0.0, 0))
+
+        # Toplam allocation %88'i geçmesin
+        total_alloc = sum(a for _, sig, a, l in candidates if l > 0)
+        scale       = min(1.0, 0.88 / total_alloc) if total_alloc > 0 else 1.0
+
+        for coin, signal, alloc, leverage in candidates:
             df            = data[coin]
             current_price = df["Close"].iloc[-1]
 
-            if leverage > 0:
+            if leverage > 0 and signal != 0:
                 final_alloc = round(alloc * scale, 2)
                 decisions.append({
                     "coin":        coin,
-                    "signal":      1,
+                    "signal":      signal,
                     "allocation":  final_alloc,
                     "leverage":    leverage,
-                    "stop_loss":   current_price * STOP_LOSS_PCT,
-                    "take_profit": current_price * TAKE_PROFIT_PCT,
+                    "stop_loss":   current_price * (1 - STOP_LOSS_PCT)
+                                   if signal == 1
+                                   else current_price * (1 + STOP_LOSS_PCT),
+                    "take_profit": current_price * (1 + TAKE_PROFIT_PCT)
+                                   if signal == 1
+                                   else current_price * (1 - TAKE_PROFIT_PCT),
                 })
             else:
                 decisions.append({
@@ -213,37 +334,40 @@ class WalkForwardStrategy(BaseStrategy):
         return decisions
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     print("📦 Veri yukleniyor...")
     coin_data = get_full_data()
 
     for coin, df in coin_data.items():
-        print(f"  {coin}: {len(df)} satir, "
+        print(f"  {coin}: {len(df)} satir  "
               f"{df['Date'].min()} → {df['Date'].max()}")
 
     print(f"\n📐 Yapilandirma:")
-    print(f"  Egitim verisi : {TRAIN_DAYS} gun (0 → {TRAIN_DAYS})")
-    print(f"  Tahmin donemi : {PREDICT_DAYS} gun ({START_CANDLE} → {TOTAL_DAYS})")
-    print(f"  Parca buyuklugu: {CHUNK} gun")
+    print(f"  Egitim : {TRAIN_DAYS} gun  (0 → {TRAIN_DAYS})")
+    print(f"  Tahmin : {PREDICT_DAYS} gun  ({START_CANDLE} → {TOTAL_DAYS})")
+    print(f"  Parca  : {CHUNK} gun x 4")
 
-    print("\n🏋️  Walk-forward egitim basliyor...")
+    print("\n🏋️  Walk-forward egitim (Long + Short + Ensemble)...")
     os.makedirs("models", exist_ok=True)
 
     all_models = {}
     for n in range(1, 5):
-        print(f"\n=== Parca {n} egitim → Parca {n+1} tahmin ===")
-        models = train_models(coin_data, n_chunks_train=n)
+        print(f"\n=== Parca {n} → Parca {n + 1} ===")
+        models = train_models(coin_data, n)
         all_models[n] = models
-        for coin, model in models.items():
+        for coin, m in models.items():
             safe = coin.replace("-", "_").replace("/", "_")
-            joblib.dump(model, f"models/{safe}_chunk{n}.pkl")
+            for key, mdl in m.items():
+                joblib.dump(mdl, f"models/{safe}_chunk{n}_{key}.pkl")
 
     print("\n📊 Grafikler olusturuluyor...")
     for coin in COINS:
         plot_predictions(coin_data, all_models, coin)
 
     print(f"\n🚀 Backtest basliyor (start_candle={START_CANDLE})...")
-    strategy = WalkForwardStrategy(all_models)
+    strategy = AdvancedStrategy(all_models)
     result   = backtest.run(
         strategy=strategy,
         initial_capital=3000.0,
